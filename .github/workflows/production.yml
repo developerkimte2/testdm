@@ -201,10 +201,13 @@ jobs:
 
       - name: Create GitHub Release
         uses: actions/github-script@v7
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_NOTES: ${{ steps.notes.outputs.notes }}
         with:
           script: |
-            const tag   = '${{ steps.tag.outputs.tag }}';
-            const notes = `${{ steps.notes.outputs.notes }}`;
+            const tag   = process.env.RELEASE_TAG;
+            const notes = process.env.RELEASE_NOTES;
             const fs    = require('fs');
 
             await github.rest.git.createRef({
