@@ -1,0 +1,318 @@
+name: Production — Build, Deploy & Release
+
+on:
+  push:
+    branches: [production]
+  workflow_dispatch:
+    inputs:
+      rollback_tag:
+        description: |
+          ロールバック先のタグ（例: v2026.03.12-1）。
+          指定すると既存 dist.zip を再デプロイしビルドをスキップ。
+          空白のままにすると通常ビルド。
+        required: false
+        type: string
+
+permissions:
+  contents: write   # Release作成・tag push・CHANGELOG commit に必要
+  pages: write
+  id-token: write
+
+concurrency:
+  group: production
+  cancel-in-progress: false   # 本番デプロイは中断しない
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      css_version: ${{ steps.build.outputs.css_version }}
+      is_rollback: ${{ steps.rollback.outputs.is_rollback }}
+      rollback_tag: ${{ steps.rollback.outputs.rollback_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 全履歴取得 (release notes・HITL guard に必要)
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # ─── ロールバックモード判定 ────────────────────────────────────
+      - name: Check rollback mode
+        id: rollback
+        run: |
+          TAG="${{ github.event.inputs.rollback_tag }}"
+          if [ -n "$TAG" ]; then
+            echo "is_rollback=true"  >> $GITHUB_OUTPUT
+            echo "rollback_tag=${TAG}" >> $GITHUB_OUTPUT
+            echo "::notice::🔄 ROLLBACK MODE: restoring ${TAG}"
+          else
+            echo "is_rollback=false" >> $GITHUB_OUTPUT
+            echo "rollback_tag="     >> $GITHUB_OUTPUT
+            echo "::notice::🔨 BUILD MODE: normal build"
+          fi
+
+      # ─── ロールバック: dist.zip を GitHub Release から取得 ─────────
+      - name: Rollback — download dist.zip from Release
+        if: steps.rollback.outputs.is_rollback == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.rollback.outputs.rollback_tag }}"
+          echo "Downloading dist.zip from Release ${TAG}..."
+          gh release download "${TAG}" --pattern "dist.zip" --repo ${{ github.repository }}
+          unzip dist.zip
+          echo "Rollback dist/ ready."
+
+      # ─── 通常ビルド ────────────────────────────────────────────────
+      - name: Install dependencies
+        if: steps.rollback.outputs.is_rollback == 'false'
+        run: npm install
+
+      - name: Lint (pre-build)
+        if: steps.rollback.outputs.is_rollback == 'false'
+        run: npm run lint
+
+      # HITL guard — push イベント時のみ実行
+      # workflow_dispatch 時はスキップ（ロールバック・手動再デプロイ用途のため）
+      - name: HITL — block direct push of template/design-system changes
+        if: github.event_name == 'push'
+        run: |
+          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep -E '^(templates/|design-system/)' || true)
+          if [ -z "$CHANGED" ]; then
+            echo "No template/design-system changes — OK."
+            exit 0
+          fi
+          COMMIT_MSG=$(git log -1 --format=%s)
+          IS_MERGE=$(echo "$COMMIT_MSG" | grep -c '^Merge pull request' || true)
+          if [ "$IS_MERGE" -eq 0 ]; then
+            echo "::error::🚫 HITL violation: templates/ or design-system/ modified via direct push."
+            echo "$CHANGED" | sed 's/^/::error::  /'
+            echo "::error::Use a PR. See GOVERNANCE.md."
+            exit 1
+          else
+            echo "✓ PR merge — template changes allowed."
+          fi
+
+      - name: Build
+        id: build
+        if: steps.rollback.outputs.is_rollback == 'false'
+        run: |
+          npm run build
+          CSS_V=$(grep -oP '(?<=style\.css\?v=)[a-f0-9]+' dist/index.html | head -1)
+          echo "css_version=${CSS_V}" >> $GITHUB_OUTPUT
+
+      - name: Lint (post-build)
+        if: steps.rollback.outputs.is_rollback == 'false'
+        run: npm run lint
+
+      - name: Verify no unresolved placeholders
+        if: steps.rollback.outputs.is_rollback == 'false'
+        run: |
+          grep -rl '{{' dist/ && echo '::error::Unresolved placeholders found!' && exit 1 || echo 'dist/ is clean.'
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+      # dist.zip を Release 用に保存（通常ビルド時のみ。ロールバック時は再添付不要）
+      - name: Archive dist for Release
+        if: steps.rollback.outputs.is_rollback == 'false'
+        run: zip -r dist.zip dist/
+
+      - uses: actions/upload-artifact@v4
+        if: steps.rollback.outputs.is_rollback == 'false'
+        with:
+          name: dist-zip
+          path: dist.zip
+          retention-days: 90
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v4
+        id: deployment
+
+  release:
+    needs: [build, deploy]
+    runs-on: ubuntu-latest
+    # ロールバック時は新規 Release を作成しない（既存タグを保持する）
+    if: needs.build.outputs.is_rollback == 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 日付ベースのタグを生成: v2026.03.12-1, v2026.03.12-2, ...
+      - name: Generate release tag
+        id: tag
+        run: |
+          DATE=$(date -u +%Y.%m.%d)
+          BASE="v${DATE}"
+          N=1
+          while git tag -l "${BASE}-${N}" | grep -q .; do
+            N=$((N+1))
+          done
+          TAG="${BASE}-${N}"
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Generated tag: ${TAG}"
+
+      # 前回 Release からの変更を収集して release notes 生成
+      - name: Generate release notes
+        id: notes
+        run: |
+          PREV_TAG=$(git tag --sort=-version:refname | head -1)
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+            HEADER="Initial release"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+            HEADER="Changes since ${PREV_TAG}"
+          fi
+          COMMITS=$(git log ${RANGE} --pretty=format:"- %s (%h)" --no-merges | head -30)
+          CSS_V="${{ needs.build.outputs.css_version }}"
+          NOTES=$(cat << ENDNOTES
+          ## ${HEADER}
+
+          ${COMMITS}
+
+          ---
+          **Build info**
+          - CSS fingerprint: \`${CSS_V}\`
+          - Deployed: $(date -u +"%Y-%m-%d %H:%M UTC")
+          - Commit: \`${GITHUB_SHA:0:8}\`
+
+          **Rollback手順**
+          Actions → production.yml → Run workflow → rollback_tag に このタグを入力
+          ENDNOTES
+          )
+          echo "notes<<EOF" >> $GITHUB_OUTPUT
+          echo "$NOTES"     >> $GITHUB_OUTPUT
+          echo "EOF"        >> $GITHUB_OUTPUT
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-zip
+
+      - name: Create GitHub Release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag   = '${{ steps.tag.outputs.tag }}';
+            const notes = `${{ steps.notes.outputs.notes }}`;
+            const fs    = require('fs');
+
+            await github.rest.git.createRef({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              ref:   `refs/tags/${tag}`,
+              sha:   context.sha,
+            });
+
+            const release = await github.rest.repos.createRelease({
+              owner:       context.repo.owner,
+              repo:        context.repo.repo,
+              tag_name:    tag,
+              name:        `Release ${tag}`,
+              body:        notes,
+              draft:       false,
+              prerelease:  false,
+              make_latest: 'true',
+            });
+
+            const zip = fs.readFileSync('dist.zip');
+            await github.rest.repos.uploadReleaseAsset({
+              owner:      context.repo.owner,
+              repo:       context.repo.repo,
+              release_id: release.data.id,
+              name:       'dist.zip',
+              data:       zip,
+            });
+
+            console.log(`Release created: ${release.data.html_url}`);
+
+      # ─── CHANGELOG.md を main に自動コミット ─────────────────────
+      # [skip ci] により staging.yml の再トリガーを防ぐ。
+      # main の Branch Protection は PR 必須ではない(status checks のみ)ので
+      # github-actions[bot] による直接 push が可能。
+      - name: Update CHANGELOG.md on main
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          DATE=$(date -u +%Y-%m-%d)
+          CSS_V="${{ needs.build.outputs.css_version }}"
+          DEPLOYED=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          # 前回タグを特定（直前に作ったタグを除外）
+          PREV_TAG=$(git tag --sort=-version:refname | grep -v "^${TAG}$" | head -1)
+          if [ -z "$PREV_TAG" ]; then
+            COMMITS=$(git log HEAD --pretty=format:"- %s (%h)" --no-merges | head -30)
+          else
+            COMMITS=$(git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges | head -30)
+          fi
+
+          # main に切り替えて最新を取得
+          git fetch origin main
+          git checkout main
+          git pull --rebase origin main
+
+          # 新エントリを一時ファイルに書き出す
+          {
+            echo "## [${TAG}] - ${DATE}"
+            echo ""
+            echo "${COMMITS}"
+            echo ""
+            echo "**CSS:** \`${CSS_V}\` | **Commit:** \`${GITHUB_SHA:0:8}\` | **Deployed:** ${DEPLOYED}"
+            echo ""
+            echo "---"
+          } > /tmp/new_entry.md
+
+          # 先頭の --- セパレータの直後に新エントリを挿入
+          if [ -f CHANGELOG.md ]; then
+            SEP_LINE=$(grep -n "^---$" CHANGELOG.md | head -1 | cut -d: -f1)
+            if [ -n "$SEP_LINE" ]; then
+              head -n "$SEP_LINE" CHANGELOG.md  > /tmp/cl_head.md
+              tail -n "+$((SEP_LINE + 1))" CHANGELOG.md > /tmp/cl_tail.md
+              cat /tmp/cl_head.md  > CHANGELOG.md
+              echo ""              >> CHANGELOG.md
+              cat /tmp/new_entry.md >> CHANGELOG.md
+              echo ""              >> CHANGELOG.md
+              cat /tmp/cl_tail.md  >> CHANGELOG.md
+            else
+              # セパレータなし(破損)の場合は先頭に追記
+              cat /tmp/new_entry.md CHANGELOG.md > /tmp/cl_merged.md
+              mv /tmp/cl_merged.md CHANGELOG.md
+            fi
+          else
+            # ファイルが存在しない場合は骨格ごと作成
+            {
+              echo "# Changelog"
+              echo ""
+              echo "Auto-generated by \`production.yml\` on each production release."
+              echo "Full details (dist.zip, CSS fingerprint): [Releases](../../releases)."
+              echo ""
+              echo "---"
+              echo ""
+              cat /tmp/new_entry.md
+            } > CHANGELOG.md
+          fi
+
+          # git config & commit
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+
+          # 差分がない場合は何もしない
+          if git diff --cached --quiet; then
+            echo "No CHANGELOG changes to commit."
+            exit 0
+          fi
+
+          # [skip ci] で staging.yml の再トリガーを防ぐ
+          git commit -m "chore: update CHANGELOG for ${TAG} [skip ci]"
+          git push origin main
+      # ───────────────────────────────────────────────────────────────
