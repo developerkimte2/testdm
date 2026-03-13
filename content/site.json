@@ -1,8 +1,8 @@
 {
   "site_name": "Acme Corp",
   "lang": "ja",
-  "base_url": "https://tak-goto.github.io/static-web-poc",
-  "og_default_image": "https://tak-goto.github.io/static-web-poc/images/og-default.png",
+  "base_url": "https://developerkimte2.github.io/testdm",
+  "og_default_image": "https://developerkimte2.github.io/testdm/images/og-default.png",
   "copyright": "© 2025 Acme Corp",
   "cta_label": "お問い合わせ",
   "cta_url": "contact.html",
